@@ -1,0 +1,15 @@
+# TikTok Creator Payment Tracker Bot - Dependencies
+
+# Discord API wrapper
+discord.py>=2.3.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# HTTP client for URL resolution
+aiohttp>=3.9.0
+
+# TikTok scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
