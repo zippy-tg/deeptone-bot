@@ -16,7 +16,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from database import Database, VideoRecord, PaymentStatus
+from database import Database, VideoRecord, PaymentStatus, CreatorProfile
 from utils import (
     TikTokURLParser,
     TikTokScraper,
@@ -29,6 +29,17 @@ from utils import (
     parse_views_input,
     parse_date_input,
     get_status_emoji,
+    get_rank_display,
+    get_rank_color,
+    get_rank_emoji,
+    CreatorRank,
+    determine_rank,
+    get_next_rank,
+    views_to_next_rank,
+    RANK_THRESHOLDS,
+    RANK_CAPS,
+    RANK_PAYOUT_TIERS,
+    RANK_ORDER,
 )
 
 # Load environment variables
@@ -51,9 +62,23 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
 
 # =============================================================================
-# OWNER ONLY - Change this to your Discord User ID
+# ALLOWED USERS - Owner + authorized creators
 # =============================================================================
 OWNER_ID = 1354609986902425754
+ALLOWED_USERS = {OWNER_ID, 1466569957730025482}
+# =============================================================================
+
+# =============================================================================
+# RANK ROLE IDS - Discord role IDs for each creator rank
+# =============================================================================
+RANK_ROLES = {
+    CreatorRank.SUB5: 1469123133914087585,
+    CreatorRank.LTN: 1469123258140987465,
+    CreatorRank.MTN: 1469123321973969000,
+    CreatorRank.HTN: 1469123432464519230,
+    CreatorRank.CHADLITE: 1470452632970592472,
+    CreatorRank.CHAD: 1469123487686856836,
+}
 # =============================================================================
 
 # Embed colors
@@ -87,6 +112,7 @@ class PaymentBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.reactions = True
+        intents.members = True  # Needed for role assignment
 
         super().__init__(
             command_prefix=COMMAND_PREFIX,
@@ -138,7 +164,7 @@ async def on_message(message):
     # Check if message is a command (starts with prefix)
     if message.content.startswith(COMMAND_PREFIX):
         # Only allow owner to use commands
-        if message.author.id != OWNER_ID:
+        if message.author.id not in ALLOWED_USERS:
             await message.channel.send(f"{EMOJI_ERROR} This bot is private and can only be used by the owner.")
             return
 
@@ -207,12 +233,87 @@ async def confirm_action(ctx: commands.Context, message: str, timeout: int = 30)
         return False
 
 
-def create_payment_breakdown_embed(video: VideoRecord, title: str, color: int) -> discord.Embed:
+async def update_creator_role(guild: discord.Guild, creator_name: str, channel: discord.TextChannel = None):
+    """Check creator rank and update Discord role if needed. Returns (old_rank, new_rank) if changed."""
+    profile = bot.db.get_or_create_creator(creator_name)
+    new_rank = profile.current_rank
+
+    if not profile.discord_user_id:
+        return None
+
+    member = guild.get_member(profile.discord_user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(profile.discord_user_id)
+        except discord.NotFound:
+            return None
+
+    # Get all rank role IDs that exist
+    all_rank_role_ids = {rid for rid in RANK_ROLES.values() if rid}
+
+    # Find which rank roles the member currently has
+    current_rank_roles = [r for r in member.roles if r.id in all_rank_role_ids]
+
+    # Get the target role
+    target_role_id = RANK_ROLES.get(new_rank)
+    if not target_role_id:
+        return None
+
+    target_role = guild.get_role(target_role_id)
+    if not target_role:
+        return None
+
+    # Check if they already have the correct role
+    if target_role in current_rank_roles and len(current_rank_roles) == 1:
+        return None
+
+    # Determine old rank for notification
+    old_rank = None
+    if current_rank_roles:
+        for rank, role_id in RANK_ROLES.items():
+            if any(r.id == role_id for r in current_rank_roles):
+                old_rank = rank
+                break
+
+    # Remove all other rank roles
+    roles_to_remove = [r for r in current_rank_roles if r.id != target_role_id]
+    if roles_to_remove:
+        await member.remove_roles(*roles_to_remove, reason="Rank update")
+
+    # Add new rank role if not already present
+    if target_role not in member.roles:
+        await member.add_roles(target_role, reason=f"Rank up to {new_rank.value}")
+
+    # Send rank up notification
+    if old_rank and old_rank != new_rank and channel:
+        old_idx = RANK_ORDER.index(old_rank)
+        new_idx = RANK_ORDER.index(new_rank)
+        if new_idx > old_idx:
+            embed = create_embed(
+                "🎉 RANK UP!",
+                f"**{creator_name}** has been promoted!\n\n"
+                f"{get_rank_display(old_rank)} → {get_rank_display(new_rank)}\n\n"
+                f"**Lifetime Views:** {format_views(profile.lifetime_views)}\n"
+                f"**New Per-Video Cap:** ${RANK_CAPS[new_rank]}",
+                get_rank_color(new_rank)
+            )
+            await channel.send(embed=embed)
+
+    return (old_rank, new_rank) if old_rank != new_rank else None
+
+
+def create_payment_breakdown_embed(video: VideoRecord, title: str, color: int, creator_rank: CreatorRank = None) -> discord.Embed:
     """Create an embed showing payment breakdown for a video."""
-    payment = calculate_payment(video.view_count)
+    # Get creator rank if not provided
+    if creator_rank is None:
+        profile = bot.db.get_or_create_creator(video.creator_name)
+        creator_rank = profile.current_rank
+
+    payment = calculate_payment(video.view_count, creator_rank)
 
     embed = create_embed(title, "", color)
     embed.add_field(name="Creator", value=video.creator_name, inline=True)
+    embed.add_field(name="Rank", value=get_rank_display(creator_rank), inline=True)
     embed.add_field(name="Views", value=format_views(video.view_count), inline=True)
     embed.add_field(name="Status", value=f"{get_status_emoji(video.payment_status.value)} {video.payment_status.value.title()}", inline=True)
 
@@ -229,12 +330,11 @@ def create_payment_breakdown_embed(video: VideoRecord, title: str, color: int) -
     if payment.eligible:
         breakdown = f"**Base:** ${payment.base_payment:.0f} (20k+ qualified)\n"
         if payment.bonuses:
-            breakdown += "**Bonuses:**\n"
+            breakdown += "**Performance Boosts:**\n"
             for threshold, amount in payment.bonuses:
-                breakdown += f"  └ {format_views(threshold)} milestone: +${amount}\n"
+                breakdown += f"  └ {format_views(threshold)} views: +${amount}\n"
         breakdown += f"\n**Total:** ${payment.total_payment:.0f}"
-        if payment.needs_custom_bonus:
-            breakdown += "\n\n⚠️ **Custom Bonus Pending**\n_Additional bonus based on app conversion performance_"
+        breakdown += f"\n**Per-Video Cap:** ${RANK_CAPS[creator_rank]}"
         embed.add_field(name="💰 Payment Breakdown", value=breakdown, inline=False)
     else:
         embed.add_field(name="💰 Payment", value="Not eligible (< 20k views)", inline=False)
@@ -275,6 +375,13 @@ async def help_command(ctx: commands.Context):
         (f"`{COMMAND_PREFIX}reject [id] [reason]`", "Reject a payment"),
     ]
 
+    rank_cmds = [
+        (f"`{COMMAND_PREFIX}rank [creator]`", "Show creator rank & progress"),
+        (f"`{COMMAND_PREFIX}ranks`", "All creators ranked by views"),
+        (f"`{COMMAND_PREFIX}ladder`", "Full earnings ladder tiers"),
+        (f"`{COMMAND_PREFIX}setcreator @user name`", "Link Discord user to creator"),
+    ]
+
     reports = [
         (f"`{COMMAND_PREFIX}stats`", "Overall statistics"),
         (f"`{COMMAND_PREFIX}creator [name]`", "Videos for specific creator"),
@@ -290,8 +397,8 @@ async def help_command(ctx: commands.Context):
     ]
 
     for name, cmds in [("📥 Submission", submission), ("📊 Status", status_cmds),
-                       ("💳 Payments", payment_cmds), ("📈 Reports", reports),
-                       ("🔧 Management", management)]:
+                       ("💳 Payments", payment_cmds), ("🏆 Ranks", rank_cmds),
+                       ("📈 Reports", reports), ("🔧 Management", management)]:
         value = "\n".join([f"{cmd} - {desc}" for cmd, desc in cmds])
         embed.add_field(name=name, value=value, inline=False)
 
@@ -453,14 +560,19 @@ async def submit_video(ctx: commands.Context, url: str = None):
             await ctx.message.add_reaction(EMOJI_ERROR)
             return
 
-    # Calculate payment
-    payment = calculate_payment(views)
+    # Get creator rank for payment calculation
+    profile = bot.db.get_or_create_creator(creator_name)
+    creator_rank = profile.current_rank
+
+    # Calculate payment based on rank
+    payment = calculate_payment(views, creator_rank)
     date_eligible = date_posted + timedelta(hours=48)
     hours_until = max(0, (date_eligible - datetime.now()).total_seconds() / 3600)
 
     # Show preview
     preview_embed = create_embed("📋 Confirm Submission", "", COLOR_WARNING)
     preview_embed.add_field(name="Creator", value=creator_name, inline=True)
+    preview_embed.add_field(name="Rank", value=get_rank_display(creator_rank), inline=True)
     preview_embed.add_field(name="Views", value=format_views(views), inline=True)
     preview_embed.add_field(name="Posted", value=format_date_short(date_posted), inline=True)
 
@@ -470,9 +582,7 @@ async def submit_video(ctx: commands.Context, url: str = None):
         preview_embed.add_field(name="Eligible", value="Now ✅", inline=True)
 
     if payment.eligible:
-        preview_embed.add_field(name="Payment", value=f"${payment.total_payment:.0f}", inline=True)
-        if payment.needs_custom_bonus:
-            preview_embed.add_field(name="⚠️ Note", value="150k+ requires custom review", inline=True)
+        preview_embed.add_field(name="Payment", value=f"${payment.total_payment:.0f} (cap: ${RANK_CAPS[creator_rank]})", inline=True)
     else:
         preview_embed.add_field(name="Payment", value="Not eligible (< 20k)", inline=True)
 
@@ -501,10 +611,15 @@ async def submit_video(ctx: commands.Context, url: str = None):
         result_embed = create_payment_breakdown_embed(
             video,
             f"{EMOJI_SUCCESS} Video Logged Successfully",
-            COLOR_SUCCESS
+            COLOR_SUCCESS,
+            creator_rank
         )
         await ctx.send(embed=result_embed)
-        logger.info(f"Added video {video_id} - {creator_name} - {views} views")
+        logger.info(f"Added video {video_id} - {creator_name} - {views} views - Rank: {creator_rank.value}")
+
+        # Check for rank change and update role
+        if ctx.guild:
+            await update_creator_role(ctx.guild, creator_name, ctx.channel)
 
     except Exception as e:
         logger.error(f"Failed to save video: {e}")
@@ -546,9 +661,13 @@ async def update_views(ctx: commands.Context, video_id: str = None, new_views: s
         ))
         return
 
+    # Get creator rank
+    profile = bot.db.get_or_create_creator(existing.creator_name)
+    creator_rank = profile.current_rank
+
     old_views = existing.view_count
     old_payment = existing.total_payment
-    payment = calculate_payment(views)
+    payment = calculate_payment(views, creator_rank)
 
     # Check for suspicious changes
     warnings = []
@@ -560,6 +679,7 @@ async def update_views(ctx: commands.Context, video_id: str = None, new_views: s
     # Show comparison
     embed = create_embed("📊 View Update Preview", "", COLOR_WARNING)
     embed.add_field(name="Creator", value=existing.creator_name, inline=True)
+    embed.add_field(name="Rank", value=get_rank_display(creator_rank), inline=True)
     embed.add_field(name="Old Views", value=format_views(old_views), inline=True)
     embed.add_field(name="New Views", value=format_views(views), inline=True)
     embed.add_field(name="Old Payment", value=f"${old_payment:.0f}", inline=True)
@@ -591,6 +711,10 @@ async def update_views(ctx: commands.Context, video_id: str = None, new_views: s
             f"**Payment**: ${old_payment:.0f} → ${payment.total_payment:.0f}",
             COLOR_SUCCESS
         ))
+
+        # Check for rank change and update role
+        if ctx.guild:
+            await update_creator_role(ctx.guild, existing.creator_name, ctx.channel)
     else:
         await ctx.send(embed=create_embed(f"{EMOJI_ERROR} Update Failed", "", COLOR_ERROR))
 
@@ -915,15 +1039,32 @@ async def show_creator(ctx: commands.Context, *, creator_name: str = None):
         ))
         return
 
-    total_views = sum(v.view_count for v in videos)
-    total_paid = sum(v.total_payment for v in videos if v.payment_status == PaymentStatus.PAID)
-    total_owed = sum(v.total_payment for v in videos if v.payment_status == PaymentStatus.ELIGIBLE)
+    # Get rank info
+    profile = bot.db.get_or_create_creator(creator_name)
+
+    total_views = profile.lifetime_views
+    total_paid = profile.total_paid
+    total_owed = profile.unpaid_amount
+
+    # Progress to next rank
+    next_rank = get_next_rank(profile.current_rank)
+    progress_text = ""
+    if next_rank:
+        remaining = views_to_next_rank(profile.current_rank, total_views)
+        next_threshold = RANK_THRESHOLDS[next_rank]
+        progress_pct = min(100, (total_views / next_threshold) * 100)
+        progress_text = f"\n**Next Rank:** {get_rank_display(next_rank)} ({format_views(remaining)} views away - {progress_pct:.0f}%)"
+    else:
+        progress_text = "\n**Max Rank Achieved!** 👑"
 
     embed = create_embed(
         f"👤 {videos[0].creator_name}",
-        f"**{len(videos)} videos** | **{format_views(total_views)} total views**\n"
-        f"**Paid:** ${total_paid:,.0f} | **Owed:** ${total_owed:,.0f}",
-        COLOR_INFO
+        f"**Rank:** {get_rank_display(profile.current_rank)}\n"
+        f"**{len(videos)} videos** | **{format_views(total_views)} lifetime views**\n"
+        f"**Paid:** ${total_paid:,.0f} | **Owed:** ${total_owed:,.0f}\n"
+        f"**Per-Video Cap:** ${RANK_CAPS[profile.current_rank]}"
+        f"{progress_text}",
+        get_rank_color(profile.current_rank)
     )
 
     for v in videos[:10]:
@@ -1159,6 +1300,189 @@ async def delete_video(ctx: commands.Context, video_id: str = None):
         logger.info(f"Deleted {video_id}")
     else:
         await ctx.send(embed=create_embed(f"{EMOJI_ERROR} Delete Failed", "", COLOR_ERROR))
+
+
+# ============================================================================
+# Rank Commands
+# ============================================================================
+
+@bot.command(name="rank")
+async def show_rank(ctx: commands.Context, *, creator_name: str = None):
+    """Show a creator's rank, lifetime views, and progress to next rank."""
+    if not creator_name:
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Missing Creator Name",
+            f"Usage: `{COMMAND_PREFIX}rank [creator_name]`",
+            COLOR_ERROR
+        ))
+        return
+
+    videos = bot.db.get_creator_videos(creator_name)
+    if not videos:
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Creator Not Found",
+            f"No records for: **{creator_name}**",
+            COLOR_ERROR
+        ))
+        return
+
+    profile = bot.db.get_or_create_creator(creator_name)
+    rank = profile.current_rank
+
+    embed = create_embed(
+        f"{get_rank_emoji(rank)} {creator_name}'s Rank",
+        "",
+        get_rank_color(rank)
+    )
+
+    embed.add_field(name="Current Rank", value=get_rank_display(rank), inline=True)
+    embed.add_field(name="Lifetime Views", value=format_views(profile.lifetime_views), inline=True)
+    embed.add_field(name="Videos", value=str(profile.video_count), inline=True)
+    embed.add_field(name="Per-Video Cap", value=f"${RANK_CAPS[rank]}", inline=True)
+    embed.add_field(name="Total Paid", value=f"${profile.total_paid:,.0f}", inline=True)
+    embed.add_field(name="Owed", value=f"${profile.unpaid_amount:,.0f}", inline=True)
+
+    # Show payout tiers for their rank
+    tiers = RANK_PAYOUT_TIERS[rank]
+    tiers_text = ""
+    for threshold, amount in tiers:
+        tiers_text += f"${amount} at {format_views(threshold)} views\n"
+    embed.add_field(name="💰 Payout Tiers", value=tiers_text, inline=False)
+
+    # Progress to next rank
+    next_rank = get_next_rank(rank)
+    if next_rank:
+        remaining = views_to_next_rank(rank, profile.lifetime_views)
+        next_threshold = RANK_THRESHOLDS[next_rank]
+        current_threshold = RANK_THRESHOLDS[rank]
+        progress = profile.lifetime_views - current_threshold
+        total_needed = next_threshold - current_threshold
+        progress_pct = min(100, (progress / total_needed) * 100) if total_needed > 0 else 0
+
+        # Progress bar
+        filled = int(progress_pct / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+
+        embed.add_field(
+            name=f"📈 Progress to {get_rank_display(next_rank)}",
+            value=f"`[{bar}]` {progress_pct:.0f}%\n"
+                  f"{format_views(remaining)} views remaining\n"
+                  f"Need: {format_views(next_threshold)} lifetime views",
+            inline=False
+        )
+    else:
+        embed.add_field(name="👑 Max Rank!", value="You've reached the highest rank!", inline=False)
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="ranks")
+async def show_all_ranks(ctx: commands.Context):
+    """Show all creators and their ranks."""
+    creators = bot.db.get_all_creators_with_ranks()
+
+    if not creators:
+        await ctx.send(embed=create_embed(
+            "🏆 Creator Rankings",
+            "No creators registered yet.",
+            COLOR_INFO
+        ))
+        return
+
+    embed = create_embed(
+        "🏆 Creator Rankings",
+        f"**{len(creators)} creators** ranked by lifetime views",
+        COLOR_INFO
+    )
+
+    for c in creators[:15]:
+        next_rank = get_next_rank(c.current_rank)
+        progress = ""
+        if next_rank:
+            remaining = views_to_next_rank(c.current_rank, c.lifetime_views)
+            progress = f"\n↗ {format_views(remaining)} to {next_rank.value}"
+
+        embed.add_field(
+            name=f"{get_rank_display(c.current_rank)}",
+            value=f"**{c.name}**\n"
+                  f"{format_views(c.lifetime_views)} views | {c.video_count} videos"
+                  f"{progress}",
+            inline=True
+        )
+
+    if len(creators) > 15:
+        embed.set_footer(text=f"Showing 15 of {len(creators)} creators")
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="setcreator")
+async def set_creator(ctx: commands.Context, member: discord.Member = None, *, tiktok_name: str = None):
+    """Link a Discord user to a TikTok creator name for auto role assignment."""
+    if not member or not tiktok_name:
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Missing Parameters",
+            f"Usage: `{COMMAND_PREFIX}setcreator @user tiktok_username`\n"
+            f"Example: `{COMMAND_PREFIX}setcreator @John johndoe123`",
+            COLOR_ERROR
+        ))
+        return
+
+    bot.db.set_creator_discord_id(tiktok_name, member.id)
+
+    # Immediately assign current rank role
+    if ctx.guild:
+        await update_creator_role(ctx.guild, tiktok_name, ctx.channel)
+
+    profile = bot.db.get_or_create_creator(tiktok_name)
+
+    await ctx.send(embed=create_embed(
+        f"{EMOJI_SUCCESS} Creator Linked",
+        f"**Discord:** {member.mention}\n"
+        f"**TikTok:** {tiktok_name}\n"
+        f"**Rank:** {get_rank_display(profile.current_rank)}\n"
+        f"**Lifetime Views:** {format_views(profile.lifetime_views)}",
+        COLOR_SUCCESS
+    ))
+
+
+@bot.command(name="ladder")
+async def show_ladder(ctx: commands.Context):
+    """Show the full earnings ladder with all rank tiers."""
+    embed = create_embed(
+        "💰 BonesMaxx Creator Earnings Ladder",
+        "Earnings are calculated per qualifying video.\n"
+        "Higher ranks unlock greater payout ceilings.\n"
+        "Rank upgrades are permanent.",
+        COLOR_INFO
+    )
+
+    for rank in RANK_ORDER:
+        tiers = RANK_PAYOUT_TIERS[rank]
+        threshold = RANK_THRESHOLDS[rank]
+
+        tier_text = ""
+        if threshold > 0:
+            tier_text += f"_Unlocked at {format_views(threshold)} lifetime views_\n\n"
+
+        running_total = 0
+        for view_thresh, amount in tiers:
+            running_total += amount
+            if view_thresh == 20000:
+                tier_text += f"${amount} at {format_views(view_thresh)} views\n"
+            else:
+                tier_text += f"+${amount} at {format_views(view_thresh)} views (${running_total} total)\n"
+
+        tier_text += f"\n**Per-video cap: ${RANK_CAPS[rank]}**"
+
+        embed.add_field(
+            name=get_rank_display(rank),
+            value=tier_text,
+            inline=False
+        )
+
+    embed.set_footer(text="Lifetime views = total verified views across all content")
+    await ctx.send(embed=embed)
 
 
 # ============================================================================

@@ -5,9 +5,10 @@ Handles URL parsing, TikTok scraping, payment calculation, and other helpers.
 
 import re
 import logging
-from typing import Optional, Tuple, NamedTuple
+from typing import Optional, Tuple, NamedTuple, List
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 import aiohttp
 import requests
 from bs4 import BeautifulSoup
@@ -39,6 +40,110 @@ TIKTOK_PATTERNS = {
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
+class CreatorRank(Enum):
+    """Creator rank tiers based on lifetime views."""
+    SUB5 = "SUB5"
+    LTN = "LTN"
+    MTN = "MTN"
+    HTN = "HTN"
+    CHADLITE = "CHADLITE"
+    CHAD = "CHAD"
+
+
+# Rank thresholds (lifetime views needed to unlock)
+RANK_THRESHOLDS = {
+    CreatorRank.SUB5: 0,
+    CreatorRank.LTN: 100_000,
+    CreatorRank.MTN: 300_000,
+    CreatorRank.HTN: 750_000,
+    CreatorRank.CHADLITE: 2_000_000,
+    CreatorRank.CHAD: 5_000_000,
+}
+
+# Rank display info
+RANK_INFO = {
+    CreatorRank.SUB5: {"emoji": "🩶", "name": "SUB5 CREATOR", "color": 0x808080},
+    CreatorRank.LTN: {"emoji": "🔵", "name": "LTN CREATOR", "color": 0x3498DB},
+    CreatorRank.MTN: {"emoji": "🟢", "name": "MTN CREATOR", "color": 0x2ECC71},
+    CreatorRank.HTN: {"emoji": "🟠", "name": "HTN CREATOR", "color": 0xE67E22},
+    CreatorRank.CHADLITE: {"emoji": "🟣", "name": "CHADLITE CREATOR", "color": 0x9B59B6},
+    CreatorRank.CHAD: {"emoji": "🔴", "name": "CHAD CREATOR", "color": 0xE74C3C},
+}
+
+# Per-video payout tiers by rank: list of (view_threshold, payment_amount)
+RANK_PAYOUT_TIERS = {
+    CreatorRank.SUB5: [
+        (20_000, 20),
+    ],
+    CreatorRank.LTN: [
+        (20_000, 20),
+        (100_000, 20),
+    ],
+    CreatorRank.MTN: [
+        (20_000, 20),
+        (100_000, 25),
+        (500_000, 30),
+    ],
+    CreatorRank.HTN: [
+        (20_000, 20),
+        (100_000, 25),
+        (500_000, 45),
+        (1_000_000, 40),
+    ],
+    CreatorRank.CHADLITE: [
+        (20_000, 20),
+        (100_000, 25),
+        (500_000, 45),
+        (1_000_000, 60),
+    ],
+    CreatorRank.CHAD: [
+        (20_000, 20),
+        (100_000, 30),
+        (500_000, 50),
+        (1_000_000, 75),
+    ],
+}
+
+# Per-video caps by rank
+RANK_CAPS = {
+    CreatorRank.SUB5: 20,
+    CreatorRank.LTN: 40,
+    CreatorRank.MTN: 75,
+    CreatorRank.HTN: 130,
+    CreatorRank.CHADLITE: 150,
+    CreatorRank.CHAD: 175,
+}
+
+# Ordered list of ranks for progression
+RANK_ORDER = [CreatorRank.SUB5, CreatorRank.LTN, CreatorRank.MTN,
+              CreatorRank.HTN, CreatorRank.CHADLITE, CreatorRank.CHAD]
+
+
+def determine_rank(lifetime_views: int) -> CreatorRank:
+    """Determine creator rank based on lifetime views."""
+    rank = CreatorRank.SUB5
+    for r in RANK_ORDER:
+        if lifetime_views >= RANK_THRESHOLDS[r]:
+            rank = r
+    return rank
+
+
+def get_next_rank(current_rank: CreatorRank) -> Optional[CreatorRank]:
+    """Get the next rank above the current one, or None if max."""
+    idx = RANK_ORDER.index(current_rank)
+    if idx < len(RANK_ORDER) - 1:
+        return RANK_ORDER[idx + 1]
+    return None
+
+
+def views_to_next_rank(current_rank: CreatorRank, lifetime_views: int) -> Optional[int]:
+    """Get views remaining to unlock next rank. None if max rank."""
+    next_rank = get_next_rank(current_rank)
+    if next_rank is None:
+        return None
+    return max(0, RANK_THRESHOLDS[next_rank] - lifetime_views)
+
+
 @dataclass
 class TikTokVideoData:
     """Scraped TikTok video data."""
@@ -59,6 +164,8 @@ class PaymentCalculation:
     tiers: int
     eligible: bool
     bonuses: list  # List of (threshold, amount) tuples
+    rank: CreatorRank = CreatorRank.SUB5
+    per_video_cap: float = 20
 
 
 class TikTokURLParser:
@@ -330,18 +437,12 @@ class TikTokScraper:
             return TikTokVideoData(error=f"Scraping error: {str(e)}")
 
 
-def calculate_payment(views: int) -> PaymentCalculation:
+def calculate_payment(views: int, rank: CreatorRank = CreatorRank.SUB5) -> PaymentCalculation:
     """
-    Calculate payment based on view count.
+    Calculate payment based on view count and creator rank.
 
-    Payment Structure (New Creators):
-    - Base: FLAT $20 for any video with 20k+ views
-    - Bonuses are ONE-TIME add-ons (not multipliers):
-      - 40k views: +$5
-      - 75k views: +$5
-      - 150k+ views: Custom bonus (based on conversion)
-
-    Example: 75,000 views = $20 (base) + $5 (40k) + $5 (75k) = $30 total
+    Each rank has different payout tiers (see RANK_PAYOUT_TIERS).
+    Base $20 at 20K is universal. Higher ranks unlock additional milestones.
     """
     if views < 20000:
         return PaymentCalculation(
@@ -351,25 +452,23 @@ def calculate_payment(views: int) -> PaymentCalculation:
             needs_custom_bonus=False,
             tiers=0,
             eligible=False,
-            bonuses=[]
+            bonuses=[],
+            rank=rank,
+            per_video_cap=RANK_CAPS[rank]
         )
 
-    # Base payment: FLAT $20 for qualifying (20k+)
-    base_payment = 20
-
-    # Bonuses are one-time add-ons per milestone
+    tiers = RANK_PAYOUT_TIERS[rank]
+    base_payment = 0
     bonuses = []
     bonus_amount = 0
 
-    if views >= 40000:
-        bonuses.append((40000, 5))
-        bonus_amount += 5
-
-    if views >= 75000:
-        bonuses.append((75000, 5))
-        bonus_amount += 5
-
-    needs_custom_bonus = views >= 150000
+    for threshold, amount in tiers:
+        if views >= threshold:
+            if threshold == 20000:
+                base_payment = amount
+            else:
+                bonuses.append((threshold, amount))
+                bonus_amount += amount
 
     total_payment = base_payment + bonus_amount
 
@@ -377,10 +476,12 @@ def calculate_payment(views: int) -> PaymentCalculation:
         base_payment=base_payment,
         bonus_amount=bonus_amount,
         total_payment=total_payment,
-        needs_custom_bonus=needs_custom_bonus,
-        tiers=1,  # Flat rate (not per 20k)
+        needs_custom_bonus=False,
+        tiers=len([t for t, _ in tiers if views >= t]),
         eligible=True,
-        bonuses=bonuses
+        bonuses=bonuses,
+        rank=rank,
+        per_video_cap=RANK_CAPS[rank]
     )
 
 
@@ -519,3 +620,19 @@ STATUS_EMOJI = {
 def get_status_emoji(status: str) -> str:
     """Get emoji for payment status."""
     return STATUS_EMOJI.get(status, "❓")
+
+
+def get_rank_emoji(rank: CreatorRank) -> str:
+    """Get emoji for creator rank."""
+    return RANK_INFO[rank]["emoji"]
+
+
+def get_rank_display(rank: CreatorRank) -> str:
+    """Get display name for creator rank."""
+    info = RANK_INFO[rank]
+    return f"{info['emoji']} {info['name']}"
+
+
+def get_rank_color(rank: CreatorRank) -> int:
+    """Get embed color for creator rank."""
+    return RANK_INFO[rank]["color"]

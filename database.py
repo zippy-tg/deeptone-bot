@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
+from utils import CreatorRank, determine_rank
+
 logger = logging.getLogger(__name__)
 
 DB_FILE = "creator_payments.db"
@@ -109,6 +111,18 @@ class VideoRecord:
 
 
 @dataclass
+class CreatorProfile:
+    """Creator profile with rank info."""
+    name: str
+    lifetime_views: int
+    current_rank: CreatorRank
+    discord_user_id: Optional[int]
+    video_count: int
+    total_paid: float
+    unpaid_amount: float
+
+
+@dataclass
 class CreatorStats:
     """Statistics for a single creator."""
     name: str
@@ -181,11 +195,21 @@ class Database:
                     notes TEXT
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS creators (
+                    creator_name TEXT PRIMARY KEY,
+                    discord_user_id INTEGER,
+                    current_rank TEXT DEFAULT 'SUB5',
+                    lifetime_views INTEGER DEFAULT 0,
+                    date_created TEXT NOT NULL
+                )
+            """)
             # Create indexes
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_video_id ON videos(video_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_creator_name ON videos(creator_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_payment_status ON videos(payment_status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_date_eligible ON videos(date_eligible)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_creator_discord ON creators(discord_user_id)")
             logger.info("Database initialized successfully")
 
     def check_duplicate(self, video_id: str) -> Optional[VideoRecord]:
@@ -552,6 +576,111 @@ class Database:
             if count > 0:
                 logger.info(f"Updated {count} videos from pending to eligible")
             return count
+
+    # ========================================================================
+    # Creator Rank Methods
+    # ========================================================================
+
+    def get_or_create_creator(self, creator_name: str) -> CreatorProfile:
+        """Get creator profile, creating if needed. Recalculates lifetime views."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Calculate lifetime views from all non-rejected videos
+            cursor.execute("""
+                SELECT COALESCE(SUM(view_count), 0) as total_views,
+                       COUNT(*) as video_count,
+                       COALESCE(SUM(CASE WHEN payment_status = 'paid' THEN total_payment ELSE 0 END), 0) as total_paid,
+                       COALESCE(SUM(CASE WHEN payment_status = 'eligible' THEN total_payment ELSE 0 END), 0) as unpaid
+                FROM videos
+                WHERE LOWER(creator_name) = LOWER(?)
+                  AND payment_status != 'rejected'
+            """, (creator_name,))
+            row = cursor.fetchone()
+            lifetime_views = row["total_views"]
+            video_count = row["video_count"]
+            total_paid = row["total_paid"]
+            unpaid_amount = row["unpaid"]
+
+            # Determine rank
+            rank = determine_rank(lifetime_views)
+
+            # Upsert creator
+            cursor.execute("""
+                INSERT INTO creators (creator_name, current_rank, lifetime_views, date_created)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(creator_name) DO UPDATE SET
+                    current_rank = ?,
+                    lifetime_views = ?
+            """, (creator_name, rank.value, lifetime_views, datetime.now().isoformat(),
+                  rank.value, lifetime_views))
+
+            # Get discord user id
+            cursor.execute("SELECT discord_user_id FROM creators WHERE creator_name = ?", (creator_name,))
+            creator_row = cursor.fetchone()
+            discord_user_id = creator_row["discord_user_id"] if creator_row else None
+
+            return CreatorProfile(
+                name=creator_name,
+                lifetime_views=lifetime_views,
+                current_rank=rank,
+                discord_user_id=discord_user_id,
+                video_count=video_count,
+                total_paid=total_paid,
+                unpaid_amount=unpaid_amount
+            )
+
+    def set_creator_discord_id(self, creator_name: str, discord_user_id: int) -> bool:
+        """Link a Discord user to a creator name."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Ensure creator exists
+            cursor.execute("""
+                INSERT INTO creators (creator_name, discord_user_id, date_created)
+                VALUES (?, ?, ?)
+                ON CONFLICT(creator_name) DO UPDATE SET discord_user_id = ?
+            """, (creator_name, discord_user_id, datetime.now().isoformat(), discord_user_id))
+            return cursor.rowcount > 0
+
+    def get_creator_by_discord_id(self, discord_user_id: int) -> Optional[str]:
+        """Get creator name linked to a Discord user ID."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT creator_name FROM creators WHERE discord_user_id = ?", (discord_user_id,))
+            row = cursor.fetchone()
+            return row["creator_name"] if row else None
+
+    def get_all_creators_with_ranks(self) -> List[CreatorProfile]:
+        """Get all creators with their rank info."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT
+                    v.creator_name,
+                    COALESCE(SUM(v.view_count), 0) as lifetime_views,
+                    COUNT(*) as video_count,
+                    COALESCE(SUM(CASE WHEN v.payment_status = 'paid' THEN v.total_payment ELSE 0 END), 0) as total_paid,
+                    COALESCE(SUM(CASE WHEN v.payment_status = 'eligible' THEN v.total_payment ELSE 0 END), 0) as unpaid,
+                    c.discord_user_id
+                FROM videos v
+                LEFT JOIN creators c ON LOWER(v.creator_name) = LOWER(c.creator_name)
+                WHERE v.payment_status != 'rejected'
+                GROUP BY v.creator_name
+                ORDER BY lifetime_views DESC
+            """)
+            results = []
+            for row in cursor.fetchall():
+                rank = determine_rank(row["lifetime_views"])
+                results.append(CreatorProfile(
+                    name=row["creator_name"],
+                    lifetime_views=row["lifetime_views"],
+                    current_rank=rank,
+                    discord_user_id=row["discord_user_id"],
+                    video_count=row["video_count"],
+                    total_paid=row["total_paid"],
+                    unpaid_amount=row["unpaid"]
+                ))
+            return results
 
     def export_to_csv_data(self) -> List[Tuple]:
         """Get all data for CSV export."""
