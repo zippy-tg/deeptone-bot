@@ -380,6 +380,7 @@ async def help_command(ctx: commands.Context):
         (f"`{COMMAND_PREFIX}ranks`", "All creators ranked by views"),
         (f"`{COMMAND_PREFIX}ladder`", "Full earnings ladder tiers"),
         (f"`{COMMAND_PREFIX}setcreator @user name`", "Link Discord user to creator"),
+        (f"`{COMMAND_PREFIX}giverole @user rank`", "Manually assign rank role"),
     ]
 
     reports = [
@@ -1483,6 +1484,76 @@ async def show_ladder(ctx: commands.Context):
 
     embed.set_footer(text="Lifetime views = total verified views across all content")
     await ctx.send(embed=embed)
+
+
+@bot.command(name="giverole")
+async def give_role(ctx: commands.Context, member: discord.Member = None, *, rank_name: str = None):
+    """Manually assign a rank role to a Discord user."""
+    if not member or not rank_name:
+        rank_list = ", ".join([r.value for r in RANK_ORDER])
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Missing Parameters",
+            f"Usage: `{COMMAND_PREFIX}giverole @user rank_name`\n"
+            f"Available ranks: `{rank_list}`\n"
+            f"Example: `{COMMAND_PREFIX}giverole @John LTN`",
+            COLOR_ERROR
+        ))
+        return
+
+    # Find the rank
+    rank_name_upper = rank_name.strip().upper()
+    target_rank = None
+    for r in RANK_ORDER:
+        if r.value == rank_name_upper:
+            target_rank = r
+            break
+
+    if not target_rank:
+        rank_list = ", ".join([r.value for r in RANK_ORDER])
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Invalid Rank",
+            f"**{rank_name}** is not a valid rank.\n"
+            f"Available ranks: `{rank_list}`",
+            COLOR_ERROR
+        ))
+        return
+
+    # Get the role ID
+    role_id = RANK_ROLES.get(target_rank)
+    if not role_id:
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Role Not Configured",
+            f"No Discord role ID set for **{target_rank.value}**.",
+            COLOR_ERROR
+        ))
+        return
+
+    target_role = ctx.guild.get_role(role_id)
+    if not target_role:
+        await ctx.send(embed=create_embed(
+            f"{EMOJI_ERROR} Role Not Found",
+            f"Could not find role with ID `{role_id}` in this server.",
+            COLOR_ERROR
+        ))
+        return
+
+    # Remove all existing rank roles
+    all_rank_role_ids = {rid for rid in RANK_ROLES.values() if rid}
+    roles_to_remove = [r for r in member.roles if r.id in all_rank_role_ids and r.id != role_id]
+    if roles_to_remove:
+        await member.remove_roles(*roles_to_remove, reason=f"Manual rank set to {target_rank.value}")
+
+    # Add the new role
+    if target_role not in member.roles:
+        await member.add_roles(target_role, reason=f"Manual rank set by {ctx.author}")
+
+    await ctx.message.add_reaction(EMOJI_SUCCESS)
+    await ctx.send(embed=create_embed(
+        f"{EMOJI_SUCCESS} Role Assigned",
+        f"**User:** {member.mention}\n"
+        f"**Rank:** {get_rank_display(target_rank)}",
+        get_rank_color(target_rank)
+    ))
 
 
 # ============================================================================
